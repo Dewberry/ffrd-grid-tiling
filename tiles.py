@@ -38,6 +38,20 @@ from shapely.ops import unary_union
 from pyproj import CRS
 
 
+# Exact foot definitions published by NIST:
+# https://www.nist.gov/pml/us-surveyfoot
+METERS_PER_INTERNATIONAL_FOOT = 0.3048
+METERS_PER_US_SURVEY_FOOT = 1200.0 / 3937.0
+
+FEET_PER_MILE = 5280.0
+METERS_PER_INTERNATIONAL_MILE = FEET_PER_MILE * METERS_PER_INTERNATIONAL_FOOT
+
+SUPPORTED_HORIZONTAL_UNITS = {
+    "international_foot": METERS_PER_INTERNATIONAL_FOOT,
+    "us_survey_foot": METERS_PER_US_SURVEY_FOOT,
+    "meter": 1.0,
+}
+
 # FFRD SOP projection WKT (International foot)
 WKT = r'''PROJCS["USA_Contiguous_Albers_Equal_Area_Conic_USGS_version",
 GEOGCS["GCS_North_American_1983",
@@ -104,12 +118,16 @@ def validate_tile_resolution(tile_size: float, resolution: float) -> None:
     - Pixel count must be divisible by 512 (GDAL COG default block size)
     - Pixel count must be divisible by 16 (GDAL requirement for block alignment)
     """
+    if tile_size <= 0 or resolution <= 0:
+        raise ValueError(
+            f"tile_size and resolution must be positive, got {tile_size} and {resolution}"
+        )
     pixels = tile_size / resolution
     
     # Check for whole number of pixels
     if abs(pixels - round(pixels)) > 1e-9:
         raise ValueError(
-            f"tile_size ({tile_size} ft) / resolution ({resolution} ft) = {pixels} pixels. "
+            f"tile_size ({tile_size}) / resolution ({resolution}) = {pixels} pixels. "
             f"Must result in a whole number of pixels."
         )
     
@@ -135,17 +153,25 @@ def format_tile_id(tile_size: float, col: int, row: int, resolution: float) -> s
     Build tile_id using the scheme: T{tile-size}_R{resolution}_C±#######_R±#######
     
     Args:
-        tile_size: Tile size in feet
+        tile_size: Tile size in target CRS units
         col: Column index
         row: Row index
-        resolution: Cell resolution in feet
+        resolution: Cell resolution in target CRS units
     """
     tile_size_int = int(round(tile_size))
     resolution_int = int(round(resolution))
     # + sign is included; fixed width supports lexicographic sorting and extension
     return f"T{tile_size_int}_R{resolution_int}_C{col:+07d}_R{row:+07d}"
 
-def generate_tiles(bounds, tile_size, origin_x, origin_y, resolution):
+def generate_tiles(
+    bounds,
+    tile_size,
+    origin_x,
+    origin_y,
+    resolution,
+    horizontal_units: str,
+    meters_per_unit: float,
+):
     """
     Generate tile polygons covering given bounds (xmin, ymin, xmax, ymax),
     snapped to origin and tile size. Uses origin-anchored global col/row indices.
@@ -173,8 +199,12 @@ def generate_tiles(bounds, tile_size, origin_x, origin_y, resolution):
 
             rec = {
                 "tile_id": tile_id,
-                "tile_size_ft": float(tile_size),
-                "resolution_ft": float(resolution),
+                "tile_size_ft": float(tile_size) * meters_per_unit / METERS_PER_INTERNATIONAL_FOOT,
+                "resolution_ft": float(resolution) * meters_per_unit / METERS_PER_INTERNATIONAL_FOOT,
+                "horizontal_units": horizontal_units,
+                "meters_per_unit": meters_per_unit,
+                "tile_size": float(tile_size),
+                "resolution": float(resolution),
                 "origin_x": float(origin_x),
                 "origin_y": float(origin_y),
                 "col": col,
@@ -193,7 +223,37 @@ def generate_tiles(bounds, tile_size, origin_x, origin_y, resolution):
     return records
 
 
-def main():
+def resolve_horizontal_units(target_crs: CRS) -> tuple[str, float]:
+    """Return the supported horizontal unit and its conversion factor to meters."""
+    if not target_crs.is_projected:
+        raise ValueError(f"Target CRS must be projected: {target_crs.name}")
+    conversion_factors = [axis.unit_conversion_factor for axis in target_crs.axis_info]
+    if len(conversion_factors) != 2 or not math.isclose(
+        conversion_factors[0], conversion_factors[1], rel_tol=0.0, abs_tol=1e-15
+    ):
+        raise ValueError(
+            f"Target CRS must have two horizontal axes with matching linear units, got {conversion_factors}"
+        )
+    meters_per_unit = conversion_factors[0]
+
+    matches = [
+        (horizontal_units, expected_factor)
+        for horizontal_units, expected_factor in SUPPORTED_HORIZONTAL_UNITS.items()
+        if math.isclose(meters_per_unit, expected_factor, rel_tol=0.0, abs_tol=1e-15)
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Target CRS horizontal units must uniquely match one of {list(SUPPORTED_HORIZONTAL_UNITS.keys())}, but got {[(axis.unit_name, axis.unit_conversion_factor) for axis in target_crs.axis_info]}. Matches={matches}"
+        )
+    return matches[0]
+
+
+def miles_to_target_units(miles: float, meters_per_unit: float) -> float:
+    """Convert statute miles to target CRS linear units."""
+    return miles * METERS_PER_INTERNATIONAL_MILE / meters_per_unit
+
+
+def main(args: argparse.Namespace | None = None, target_crs: CRS | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Generate a tiling scheme (fishnet grid) from an arbitrary vector boundary layer."
     )
@@ -203,11 +263,10 @@ def main():
                         help="Optional layer name for formats that support multiple layers (e.g., geopackage)")
 
     parser.add_argument("--tile-size", type=float, required=True,
-                        help="Tile size in target CRS units (feet).")
+                        help="Tile size in target CRS units.")
 
     parser.add_argument("--resolution", type=float, required=True,
-                        help="Cell resolution in feet. Must be compatible with tile-size and GDAL COG requirements.")
-
+                        help="Cell resolution in target CRS units. Must be compatible with tile-size and GDAL COG requirements.")
 
     parser.add_argument("--origin-x", type=float, default=0.0,
                         help="Grid origin X for snapping (default 0.0)")
@@ -225,11 +284,14 @@ def main():
                         help="Output GeoParquet path (.parquet)")
     parser.add_argument("--compression", type=str, default="zstd",
                         help="Parquet compression (zstd/snappy/gzip/none)")
-    args = parser.parse_args()
+    if args is None:
+        args = parser.parse_args()
 
     validate_tile_resolution(args.tile_size, args.resolution)
 
-    target_crs = CRS.from_wkt(WKT)
+    if target_crs is None:
+        target_crs = CRS.from_wkt(WKT)
+    horizontal_units, meters_per_unit = resolve_horizontal_units(target_crs)
 
     print(f"Loading boundary from: {args.boundary}")
     if args.layer:
@@ -239,10 +301,11 @@ def main():
     print("Reprojecting boundary to target CRS...")
     boundary_proj = boundary.to_crs(target_crs)
 
-    # Buffer (miles -> feet); 5280 feet per mile
-    buffer_feet = args.buffer_miles * 5280.0
-    print(f"Buffering boundary by {args.buffer_miles} miles (~{buffer_feet:,.0f} ft)...")
-    boundary_buf = boundary_proj.buffer(buffer_feet).iloc[0]
+    buffer_distance = miles_to_target_units(args.buffer_miles, meters_per_unit)
+    print(
+        f"Buffering boundary by {args.buffer_miles} miles (~{buffer_distance:,.0f} {horizontal_units})..."
+    )
+    boundary_buf = boundary_proj.buffer(buffer_distance).iloc[0]
 
     bounds = boundary_buf.bounds  # (xmin, ymin, xmax, ymax)
     print(f"Buffered boundary bounds (target CRS): {bounds}")
@@ -253,7 +316,9 @@ def main():
         tile_size=args.tile_size,
         origin_x=args.origin_x,
         origin_y=args.origin_y,
-        resolution=args.resolution
+        resolution=args.resolution,
+        horizontal_units=horizontal_units,
+        meters_per_unit=meters_per_unit,
     )
     gdf = gpd.GeoDataFrame(records, geometry="geometry", crs=target_crs)
 

@@ -54,8 +54,8 @@ The `tiles.py` script creates a fishnet grid from a vector boundary:
 ```bash
 python tiles.py \
   --boundary <boundary_file> \
-  --tile-size <feet> \
-  --resolution <feet> \
+  --tile-size <target-crs-units> \
+  --resolution <target-crs-units> \
   --buffer-miles <miles> \
   --out <output.parquet>
 ```
@@ -65,8 +65,8 @@ python tiles.py \
 | Argument | Type | Description |
 |----------|------|-------------|
 | `--boundary` | string | Path to boundary vector file (required). Supports shapefile, geopackage, GeoJSON, etc. |
-| `--tile-size` | float | Tile size in feet (required). Must be compatible with resolution for COG requirements. |
-| `--resolution` | float | Cell resolution in feet (required). Pixel count must be divisible by 512. |
+| `--tile-size` | float | Tile size in target CRS units (default international feet) (required). Must be compatible with resolution for COG requirements. |
+| `--resolution` | float | Cell resolution in target CRS units (default international feet) (required). Pixel count must be divisible by 512. |
 | `--layer` | string | Optional layer name for multi-layer formats (e.g., geopackage). |
 | `--origin-x` | float | Grid origin X coordinate for snapping. Default: 0.0 |
 | `--origin-y` | float | Grid origin Y coordinate for snapping. Default: 0.0 |
@@ -94,14 +94,18 @@ The resulting GeoParquet contains:
 | Column | Type | Description |
 |--------|------|-------------|
 | `tile_id` | string | Unique tile identifier: `T{tile-size}_R{resolution}_C{col:+07d}_R{row:+07d}` |
-| `tile_size_ft` | float | Tile size in feet |
-| `resolution_ft` | float | Cell resolution in feet |
+| `tile_size_ft` | float | Tile size converted to international feet for compatibility |
+| `resolution_ft` | float | Cell resolution converted to international feet for compatibility |
+| `horizontal_units` | string | Canonical target units: `international_foot`, `us_survey_foot`, or `meter` |
+| `meters_per_unit` | float | Numeric conversion factor from target CRS units to meters |
+| `tile_size` | float | Tile size in target CRS units |
+| `resolution` | float | Cell resolution in target CRS units |
 | `origin_x` | float | Grid origin X coordinate |
 | `origin_y` | float | Grid origin Y coordinate |
 | `col` | int | Column index (increases eastward) |
 | `row` | int | Row index (increases northward) |
 | `xmin`, `ymin`, `xmax`, `ymax` | float | Tile bounds |
-| `width`, `height` | float | Tile dimensions in feet |
+| `width`, `height` | float | Tile dimensions in target CRS units |
 | `geometry` | geometry | Tile polygon (left-lower corner is column/row origin) |
 | `buffer_miles` | float | Buffer applied to boundary (if clipped) |
 
@@ -172,7 +176,13 @@ Both use the HUC4 CONUS boundary with a 10-mile buffer.
 
 ## Coordinate Reference System
 
-All operations use the **USA Contiguous Albers Equal Area Conic (USGS version)** in **international feet**:
+All operations require a projected CRS whose horizontal axes use meters, international feet, or US survey feet. Tile size, resolution, origin, bounds, width, and height use the target CRS units.
+
+By default, the tool uses the **USA Contiguous Albers Equal Area Conic (USGS version)** in international feet.
+
+To override the output CRS, Python callers may pass the optional `args: argparse.Namespace` and `target_crs: pyproj.CRS` to `tiles.main`. CRS override is not provided by the included CLI.
+
+Default output CRS:
 
 ```
 PROJCS["USA_Contiguous_Albers_Equal_Area_Conic_USGS_version",
