@@ -30,6 +30,7 @@ Example:
 
 import argparse
 import math
+from decimal import Decimal
 from pathlib import Path
 
 import geopandas as gpd
@@ -151,6 +152,9 @@ def validate_tile_resolution(tile_size: float, resolution: float) -> None:
 def format_tile_id(tile_size: float, col: int, row: int, resolution: float) -> str:
     """
     Build tile_id using the scheme: T{tile-size}_R{resolution}_C±#######_R±#######
+
+    If the provided ``tile_size`` or ``resolution`` contains a non-zero decimal value, convert
+    the dot symbol to "p". E.g. 3.5 becomes "3p5" but 3 and 3.0 become "3".
     
     Args:
         tile_size: Tile size in target CRS units
@@ -158,10 +162,12 @@ def format_tile_id(tile_size: float, col: int, row: int, resolution: float) -> s
         row: Row index
         resolution: Cell resolution in target CRS units
     """
-    tile_size_int = int(round(tile_size))
-    resolution_int = int(round(resolution))
+    tile_size_label = format(Decimal(str(tile_size)).normalize(), "f")
+    resolution_label = format(Decimal(str(resolution)).normalize(), "f")
+    tile_size_label = tile_size_label.replace(".", "p")
+    resolution_label = resolution_label.replace(".", "p")
     # + sign is included; fixed width supports lexicographic sorting and extension
-    return f"T{tile_size_int}_R{resolution_int}_C{col:+07d}_R{row:+07d}"
+    return f"T{tile_size_label}_R{resolution_label}_C{col:+07d}_R{row:+07d}"
 
 def generate_tiles(
     bounds,
